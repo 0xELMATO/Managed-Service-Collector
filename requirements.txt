@@ -1,0 +1,6 @@
+requests>=2.31,<3
+pywinrm>=0.5,<1
+requests-ntlm>=1.2,<2
+
+# Testing
+pytest>=8,<10
