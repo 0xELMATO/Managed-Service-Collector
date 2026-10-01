@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import xml.etree.ElementTree as ET
 import uuid
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,22 @@ from .utils import sanitize_filename, unique_path
 
 def _ps_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def _powershell_error(stderr: bytes) -> str:
+    """Return useful WinRM error text without PowerShell progress CLIXML noise."""
+    text = stderr.decode("utf-8", "replace").strip()
+    if not text.startswith("#< CLIXML"):
+        return text
+    try:
+        root = ET.fromstring(text.removeprefix("#< CLIXML").strip())
+        messages = []
+        for element in root.iter():
+            if element.tag.rsplit("}", 1)[-1] == "S" and element.attrib.get("S") == "Error" and element.text:
+                messages.append(element.text.replace("_x000D__x000A_", "\n").strip())
+        return "\n".join(message for message in messages if message)
+    except ET.ParseError:
+        return text
 
 
 class PingCastleCollector:
@@ -48,8 +65,9 @@ class PingCastleCollector:
             raise RuntimeError("WinRM session is not connected")
         response = self.session.run_ps(script)
         if response.status_code not in acceptable:
-            error = response.std_err.decode("utf-8", "replace").strip()
-            raise RuntimeError(f"Remote PowerShell failed ({response.status_code}): {error}")
+            error = _powershell_error(response.std_err)
+            suffix = f": {error}" if error else ""
+            raise RuntimeError(f"Remote PowerShell failed with exit code {response.status_code}{suffix}")
         return response
 
     def test_connection(self) -> tuple[str, str]:
@@ -64,15 +82,24 @@ class PingCastleCollector:
         candidates = ([self.requested_path] if self.requested_path else []) + [
             r"C:\Tools\PingCastle\PingCastle.exe", r"C:\PingCastle\PingCastle.exe",
             r"C:\Program Files\PingCastle\PingCastle.exe",
+            r"C:\Program Files (x86)\PingCastle\PingCastle.exe",
         ]
         literal = ",".join(_ps_quote(value) for value in candidates if value)
-        script = (f"$c=@({literal}); $found=$c | Where-Object {{Test-Path -LiteralPath $_ -PathType Leaf}} "
+        script = (f"$c=@({literal}); $c += @((Join-Path $env:USERPROFILE 'Desktop\\PingCastle\\PingCastle.exe'),"
+                  "(Join-Path $env:USERPROFILE 'Downloads\\PingCastle\\PingCastle.exe')); "
+                  "$expanded = foreach($item in $c){if(Test-Path -LiteralPath $item -PathType Container)"
+                  "{Join-Path $item 'PingCastle.exe'}else{$item}}; "
+                  "$found=$expanded | Where-Object {Test-Path -LiteralPath $_ -PathType Leaf} "
                   "| Select-Object -First 1; if(-not $found){$cmd=Get-Command PingCastle.exe "
                   "-ErrorAction SilentlyContinue; if($cmd){$found=$cmd.Source}}; if($found){$found}else{exit 2}")
-        response = self._run(script)
+        response = self._run(script, acceptable=(0, 2))
         self.pingcastle_path = response.std_out.decode("utf-8", "replace").strip()
-        if not self.pingcastle_path:
-            raise RuntimeError("PingCastle.exe was not found in the supplied or standard locations")
+        if response.status_code == 2 or not self.pingcastle_path:
+            supplied = f" Supplied path: {self.requested_path}." if self.requested_path else ""
+            raise RuntimeError(
+                "PingCastle.exe was not found. Enter its full path (or containing directory) on the Windows host."
+                + supplied
+            )
         self.logger.info("PingCastle found at %s", self.pingcastle_path)
         return self.pingcastle_path
 

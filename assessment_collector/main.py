@@ -154,12 +154,14 @@ def main(argv: list[str] | None = None) -> int:
                 elif module == "bloodhound":
                     creds = get_ad_credentials(cached, "BloodHound", redactor); cached = cached or creds
                     dc = input("Domain Controller: ").strip()
+                    name_server = input("DNS name server/IP (optional): ").strip()
                     method = input("Collection method [All]: ").strip() or "All"
-                    result = BloodHoundCollector(root / "bloodhound", redactor).collect(creds, dc, method)
+                    result = BloodHoundCollector(root / "bloodhound", redactor).collect(
+                        creds, dc, method, name_server)
                 elif module == "netexec":
                     creds = get_ad_credentials(cached, "NetExec", redactor); cached = cached or creds
-                    target = input("Target/CIDR: ").strip()
-                    result = NetExecCollector(root / "netexec", redactor).collect(target, creds)
+                    scope_file = Path(input("Path to scope.txt: ").strip())
+                    result = NetExecCollector(root / "netexec", redactor).collect(scope_file, creds)
                 else:
                     host = input("PingCastle server IP/hostname: ").strip()
                     mode = input("[1] WinRM HTTP - 5985\n[2] WinRM HTTPS - 5986\nCustom port\nSelect [2]: ").strip() or "2"
