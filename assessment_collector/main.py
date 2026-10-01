@@ -12,6 +12,8 @@ from pathlib import Path
 from . import __version__
 from .bloodhound import BloodHoundCollector
 from .certipy import CertipyCollector
+from .config import (configured_or_prompt, credential_defaults, env_bool, env_secret,
+                     env_text, has_credential_environment)
 from .credentials import Redactor, prompt_credentials
 from .logging_setup import configure_logging
 from .ldap_security import LdapSecurityCollector
@@ -70,10 +72,17 @@ def choose_modules() -> list[str]:
             print("[!] Enter comma/space-separated choices (for example: 1,3,6), 7, or Q.")
 
 
-def get_ad_credentials(cache: Credentials | None, module: str, redactor: Redactor) -> Credentials:
-    if cache and yes_no(f"Reuse existing AD credentials for {module}?", True):
+def get_ad_credentials(cache: Credentials | None, module: str, module_key: str,
+                       redactor: Redactor) -> Credentials:
+    environment_configured = has_credential_environment(module_key)
+    if cache and not environment_configured and yes_no(f"Reuse existing AD credentials for {module}?", True):
         return cache
-    credentials = prompt_credentials()
+    domain, username, password = credential_defaults(module_key)
+    if cache:
+        domain = domain or cache.domain
+        username = username or cache.username
+        password = password or cache.password
+    credentials = prompt_credentials(domain=domain, username=username, password=password)
     redactor.add(credentials.username, credentials.principal, credentials.password)
     return credentials
 
@@ -83,20 +92,28 @@ def run_nessus(root: Path, redactor: Redactor) -> ModuleResult:
         from .nessus import EXPORTS, NessusClient, NessusCollector
     except ImportError:
         return ModuleResult(False, "requests is not installed; run 'pip install requests'")
-    url = input("Nessus URL (for example https://scanner:8834): ").strip()
-    verify = not yes_no("Disable TLS certificate verification?", False)
+    url = configured_or_prompt("Nessus URL (for example https://scanner:8834)", "MSC_NESSUS_URL")
+    configured_verify = env_bool("MSC_NESSUS_VERIFY_TLS")
+    verify = configured_verify if configured_verify is not None else not yes_no(
+        "Disable TLS certificate verification?", False)
     if not verify:
         print("[!] WARNING: Nessus TLS certificate verification is disabled")
     client = NessusClient(url, verify_tls=verify)
     try:
-        if yes_no("Use Nessus API access/secret keys instead of a password?", True):
-            access = getpass.getpass("Nessus access key: ")
-            secret = getpass.getpass("Nessus secret key: ")
+        access = env_secret("MSC_NESSUS_ACCESS_KEY")
+        secret = env_secret("MSC_NESSUS_SECRET_KEY")
+        username = env_text("MSC_NESSUS_USERNAME")
+        password = env_secret("MSC_NESSUS_PASSWORD")
+        use_keys = bool(access or secret) or (not (username or password) and
+                                              yes_no("Use Nessus API access/secret keys instead of a password?", True))
+        if use_keys:
+            access = access or getpass.getpass("Nessus access key: ")
+            secret = secret or getpass.getpass("Nessus secret key: ")
             redactor.add(access, secret)
             client.authenticate_keys(access, secret)
         else:
-            username = input("Nessus username: ").strip()
-            password = getpass.getpass("Nessus password: ")
+            username = username or input("Nessus username: ").strip()
+            password = password or getpass.getpass("Nessus password: ")
             redactor.add(username, password)
             client.authenticate_password(username, password)
         print("[+] Authenticated to Nessus")
@@ -123,7 +140,8 @@ def run_nessus(root: Path, redactor: Redactor) -> ModuleResult:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Collect authorized security assessment evidence")
-    result.add_argument("--output", type=Path, default=Path.cwd(), help="parent output directory")
+    result.add_argument("--output", type=Path, default=Path(env_text("MSC_OUTPUT", str(Path.cwd()))),
+                        help="parent output directory (default: MSC_OUTPUT or current directory)")
     result.add_argument("--no-zip", action="store_true", help="do not create the final ZIP archive")
     result.add_argument("--debug", action="store_true", help="enable debug file logging")
     result.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -151,35 +169,43 @@ def main(argv: list[str] | None = None) -> int:
                 if module == "nessus":
                     result = run_nessus(root, redactor)
                 elif module == "certipy":
-                    creds = get_ad_credentials(cached, "Certipy", redactor); cached = cached or creds
-                    target = input("Domain Controller / LDAP target: ").strip()
+                    creds = get_ad_credentials(cached, "Certipy", "CERTIPY", redactor); cached = cached or creds
+                    target = configured_or_prompt("Domain Controller / LDAP target", "MSC_CERTIPY_DC")
                     result = CertipyCollector(root / "certipy", redactor).collect(creds, target)
                 elif module == "bloodhound":
-                    creds = get_ad_credentials(cached, "BloodHound", redactor); cached = cached or creds
-                    dc = input("Domain Controller: ").strip()
-                    name_server = input("DNS name server/IP (optional): ").strip()
-                    method = input("Collection method [All]: ").strip() or "All"
+                    creds = get_ad_credentials(cached, "BloodHound", "BLOODHOUND", redactor); cached = cached or creds
+                    dc = configured_or_prompt("Domain Controller", "MSC_BLOODHOUND_DC")
+                    name_server = configured_or_prompt("DNS name server/IP (optional)", "MSC_BLOODHOUND_NS")
+                    method = configured_or_prompt("Collection method", "MSC_BLOODHOUND_METHOD", "All")
                     result = BloodHoundCollector(root / "bloodhound", redactor).collect(
                         creds, dc, method, name_server)
                 elif module == "netexec":
-                    creds = get_ad_credentials(cached, "NetExec", redactor); cached = cached or creds
-                    scope_file = Path(input("Path to scope.txt: ").strip())
+                    creds = get_ad_credentials(cached, "NetExec", "NETEXEC", redactor); cached = cached or creds
+                    scope_file = Path(configured_or_prompt("Path to scope.txt", "MSC_NETEXEC_SCOPE_FILE"))
                     result = NetExecCollector(root / "netexec", redactor).collect(scope_file, creds)
                 elif module == "ldap":
-                    creds = get_ad_credentials(cached, "LDAP security checks", redactor); cached = cached or creds
-                    target = input("LDAP server / Domain Controller: ").strip()
+                    creds = get_ad_credentials(cached, "LDAP security checks", "LDAP", redactor); cached = cached or creds
+                    target = configured_or_prompt("LDAP server / Domain Controller", "MSC_LDAP_TARGET")
                     result = LdapSecurityCollector(root / "ldap", redactor).collect(target, creds)
                 else:
-                    host = input("PingCastle server IP/hostname: ").strip()
-                    mode = input("[1] WinRM HTTP - 5985\n[2] WinRM HTTPS - 5986\nCustom port\nSelect [2]: ").strip() or "2"
-                    port = 5985 if mode == "1" else 5986 if mode == "2" else int(mode)
-                    creds = get_ad_credentials(cached, "PingCastle", redactor); cached = cached or creds
-                    transport = input("Authentication transport [ntlm/kerberos] (ntlm): ").strip() or "ntlm"
-                    path = input("PingCastle path (optional): ").strip()
-                    server = input(f"PingCastle AD domain/server [{creds.domain}]: ").strip() or creds.domain
-                    explicit_credentials = yes_no(
+                    host = configured_or_prompt("PingCastle server IP/hostname", "MSC_PINGCASTLE_HOST")
+                    configured_port = env_text("MSC_PINGCASTLE_PORT")
+                    if configured_port:
+                        port = int(configured_port)
+                    else:
+                        mode = input("[1] WinRM HTTP - 5985\n[2] WinRM HTTPS - 5986\nCustom port\nSelect [2]: ").strip() or "2"
+                        port = 5985 if mode == "1" else 5986 if mode == "2" else int(mode)
+                    creds = get_ad_credentials(cached, "PingCastle", "PINGCASTLE", redactor); cached = cached or creds
+                    transport = configured_or_prompt("Authentication transport [ntlm/kerberos]",
+                                                     "MSC_PINGCASTLE_TRANSPORT", "ntlm")
+                    path = configured_or_prompt("PingCastle path (optional)", "MSC_PINGCASTLE_PATH")
+                    server = configured_or_prompt("PingCastle AD domain/server", "MSC_PINGCASTLE_SERVER", creds.domain)
+                    configured_explicit = env_bool("MSC_PINGCASTLE_EXPLICIT_CREDENTIALS")
+                    explicit_credentials = configured_explicit if configured_explicit is not None else yes_no(
                         "Pass credentials to PingCastle for the LDAP bind (recommended for NTLM WinRM)?", True)
-                    verify = True if port != 5986 else not yes_no("Ignore an untrusted WinRM HTTPS certificate?", False)
+                    configured_verify = env_bool("MSC_PINGCASTLE_VERIFY_TLS")
+                    verify = configured_verify if configured_verify is not None else (
+                        True if port != 5986 else not yes_no("Ignore an untrusted WinRM HTTPS certificate?", False))
                     result = PingCastleCollector(root / "pingcastle", host, port, creds, transport,
                                                  verify, path, redactor, server, explicit_credentials).collect()
             except Exception as exc:

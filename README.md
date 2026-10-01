@@ -42,7 +42,59 @@ Select one or more menu numbers separated by spaces or commas. AD credentials ar
 
 There is intentionally no credential configuration file.
 
-* **Output:** `--output` selects the parent; the default is the current directory. Each run directory is created mode `0700`.
+### Environment variables
+
+Every configured value is checked before an interactive prompt. Export variables in the current terminal, place them in a protected launcher/service environment, or prefix them on the command invocation. Do **not** commit secrets to shell profiles, `.env` files, source control, or shell scripts. Interactive `getpass` entry remains the safest default. For automation, prefer the `*_PASSWORD_FILE`, `*_ACCESS_KEY_FILE`, and `*_SECRET_KEY_FILE` variants pointing to owner-readable files (for example, mode `0600`) over direct secret environment variables.
+
+```bash
+# Shared AD defaults used by Certipy, BloodHound, NetExec, LDAP, and PingCastle
+export MSC_AD_DOMAIN='CONTOSO.LOCAL'
+export MSC_AD_USERNAME='auditor'
+export MSC_AD_PASSWORD_FILE="$HOME/.secrets/assessment-ad-password"
+
+# Common targets and module settings
+export MSC_CERTIPY_DC='10.10.10.10'
+export MSC_BLOODHOUND_DC='dc01.contoso.local'
+export MSC_BLOODHOUND_NS='10.10.10.10'
+export MSC_BLOODHOUND_METHOD='All'
+export MSC_NETEXEC_SCOPE_FILE="$PWD/scope.txt"
+export MSC_LDAP_TARGET='dc01.contoso.local'
+
+export MSC_PINGCASTLE_HOST='management01.contoso.local'
+export MSC_PINGCASTLE_PORT='5986'
+export MSC_PINGCASTLE_TRANSPORT='ntlm'
+export MSC_PINGCASTLE_PATH='C:\Tools\PingCastle\PingCastle.exe'
+export MSC_PINGCASTLE_SERVER='contoso.local'
+export MSC_PINGCASTLE_EXPLICIT_CREDENTIALS='true'
+export MSC_PINGCASTLE_VERIFY_TLS='true'
+
+export MSC_OUTPUT="$PWD/assessments"
+python3 assessment_collector.py
+```
+
+Module-specific AD credentials override the shared values field by field. Supported prefixes are `MSC_CERTIPY_`, `MSC_BLOODHOUND_`, `MSC_NETEXEC_`, `MSC_LDAP_`, and `MSC_PINGCASTLE_`, each with `DOMAIN`, `USERNAME`, `PASSWORD`, or `PASSWORD_FILE`. For example:
+
+```bash
+export MSC_PINGCASTLE_USERNAME='pingcastle-auditor'
+export MSC_PINGCASTLE_PASSWORD_FILE="$HOME/.secrets/pingcastle-password"
+```
+
+Nessus can use API keys or a password. API keys take precedence when configured:
+
+```bash
+export MSC_NESSUS_URL='https://nessus.contoso.local:8834'
+export MSC_NESSUS_ACCESS_KEY_FILE="$HOME/.secrets/nessus-access-key"
+export MSC_NESSUS_SECRET_KEY_FILE="$HOME/.secrets/nessus-secret-key"
+export MSC_NESSUS_VERIFY_TLS='true'
+
+# Alternative password authentication:
+# export MSC_NESSUS_USERNAME='api-auditor'
+# export MSC_NESSUS_PASSWORD_FILE="$HOME/.secrets/nessus-password"
+```
+
+Boolean variables accept `true/false`, `yes/no`, `on/off`, or `1/0`. Command-line `--output` overrides `MSC_OUTPUT`. Environment variables are inherited by child processes and may be readable by sufficiently privileged local users, so unset direct secret variables after the run (`unset MSC_AD_PASSWORD MSC_NESSUS_PASSWORD`) and prefer secret files or interactive prompts.
+
+* **Output:** `--output` selects the parent; otherwise `MSC_OUTPUT` is used when set, followed by the current-directory default. Each run directory is created mode `0700`.
 * **Nessus:** enter the `https://host:8834` URL interactively. API access/secret keys are preferred; username/password `/session` authentication is also supported. The account needs permission to view and export each chosen scan. TCP connectivity and enabled scan exports are required. TLS verification is on unless the operator explicitly disables it. When disabled, the collector prints one prominent warning and suppresses only urllib3's repetitive `InsecureRequestWarning` messages for those requests; unrelated warnings remain visible. Exports use the Nessus `/scans`, `/scans/{scan_id}/export`, status, and download workflow. Each scan produces `<scan>_by_host.pdf`, `<scan>_by_plugin.pdf`, `<scan>_results.csv`, and `<scan>_results.nessus` when all formats are selected.
 * **Certipy:** an ordinary authorized domain account normally suffices for read-only `find` enumeration; access can be limited by directory ACLs. The tool confirms the installed CLI exposes `find` and its output flags.
 * **BloodHound:** an authorized domain account needs the directory/network read access required by the chosen collection method. The collector discovers `bloodhound-python`/`bloodhound-ce-python`, reads help, and saves output locally without upload. The operator can separately set the domain controller (`-dc`) and an optional DNS name server (`-ns`); unsupported options are reported rather than guessed.

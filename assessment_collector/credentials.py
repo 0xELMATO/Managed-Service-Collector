@@ -22,8 +22,12 @@ class Redactor:
         return result
 
 
-def prompt_credentials(domain_label: str = "Domain") -> Credentials:
-    domain = input(f"{domain_label}: ").strip()
-    username = input("Username: ").strip()
-    password = getpass.getpass("Password: ")
+def prompt_credentials(domain_label: str = "Domain", domain: str = "", username: str = "",
+                       password: str = "") -> Credentials:
+    if not domain:
+        domain = input(f"{domain_label}: ").strip()
+    if not username:
+        username = input("Username: ").strip()
+    if not password:
+        password = getpass.getpass("Password: ")
     return Credentials(domain, username, password)
