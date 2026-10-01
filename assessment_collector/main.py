@@ -14,12 +14,13 @@ from .bloodhound import BloodHoundCollector
 from .certipy import CertipyCollector
 from .credentials import Redactor, prompt_credentials
 from .logging_setup import configure_logging
+from .ldap_security import LdapSecurityCollector
 from .models import Credentials, ModuleResult
 from .netexec import NetExecCollector
 from .pingcastle import PingCastleCollector
 from .utils import create_archive, create_output_directory, parse_selection, write_manifest
 
-MODULES = {1: "nessus", 2: "certipy", 3: "bloodhound", 4: "pingcastle", 5: "netexec"}
+MODULES = {1: "nessus", 2: "certipy", 3: "bloodhound", 4: "pingcastle", 5: "netexec", 6: "ldap"}
 
 
 def show_dependencies(selected: list[str]) -> None:
@@ -31,6 +32,7 @@ def show_dependencies(selected: list[str]) -> None:
                        "sudo apt install bloodhound.py"),
         "pingcastle": (importlib.util.find_spec("winrm") is not None, "pip install pywinrm"),
         "netexec": (bool(shutil.which("nxc") or shutil.which("netexec")), "sudo apt install netexec"),
+        "ldap": (bool(shutil.which("nxc") or shutil.which("netexec")), "sudo apt install netexec"),
     }
     for module in selected:
         present, installation = checks[module]
@@ -52,19 +54,20 @@ def choose_modules() -> list[str]:
 [3] BloodHound
 [4] PingCastle via WinRM
 [5] SMB Sweep / NetExec
-[6] Run all
+[6] LDAP Signing / Channel Binding
+[7] Run all
 [Q] Quit
 """)
     while True:
         value = input("Select modules: ").strip()
         if value.lower() == "q":
             return []
-        if value == "6":
+        if value == "7":
             return list(MODULES.values())
         try:
-            return [MODULES[index] for index in parse_selection(value, 5)]
+            return [MODULES[index] for index in parse_selection(value, 6)]
         except (ValueError, KeyError):
-            print("[!] Enter comma/space-separated choices (for example: 1,3,5), 6, or Q.")
+            print("[!] Enter comma/space-separated choices (for example: 1,3,6), 7, or Q.")
 
 
 def get_ad_credentials(cache: Credentials | None, module: str, redactor: Redactor) -> Credentials:
@@ -162,6 +165,10 @@ def main(argv: list[str] | None = None) -> int:
                     creds = get_ad_credentials(cached, "NetExec", redactor); cached = cached or creds
                     scope_file = Path(input("Path to scope.txt: ").strip())
                     result = NetExecCollector(root / "netexec", redactor).collect(scope_file, creds)
+                elif module == "ldap":
+                    creds = get_ad_credentials(cached, "LDAP security checks", redactor); cached = cached or creds
+                    target = input("LDAP server / Domain Controller: ").strip()
+                    result = LdapSecurityCollector(root / "ldap", redactor).collect(target, creds)
                 else:
                     host = input("PingCastle server IP/hostname: ").strip()
                     mode = input("[1] WinRM HTTP - 5985\n[2] WinRM HTTPS - 5986\nCustom port\nSelect [2]: ").strip() or "2"
@@ -169,9 +176,12 @@ def main(argv: list[str] | None = None) -> int:
                     creds = get_ad_credentials(cached, "PingCastle", redactor); cached = cached or creds
                     transport = input("Authentication transport [ntlm/kerberos] (ntlm): ").strip() or "ntlm"
                     path = input("PingCastle path (optional): ").strip()
+                    server = input(f"PingCastle AD domain/server [{creds.domain}]: ").strip() or creds.domain
+                    explicit_credentials = yes_no(
+                        "Pass credentials to PingCastle for the LDAP bind (recommended for NTLM WinRM)?", True)
                     verify = True if port != 5986 else not yes_no("Ignore an untrusted WinRM HTTPS certificate?", False)
                     result = PingCastleCollector(root / "pingcastle", host, port, creds, transport,
-                                                 verify, path, redactor).collect()
+                                                 verify, path, redactor, server, explicit_credentials).collect()
             except Exception as exc:
                 logger.exception("Unhandled %s module error", module)
                 result = ModuleResult(False, str(exc))

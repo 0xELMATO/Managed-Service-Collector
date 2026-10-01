@@ -18,7 +18,8 @@ class RedactingFormatter(logging.Formatter):
 def configure_logging(root: Path, redactor: Redactor, debug: bool = False) -> logging.Logger:
     logs = root / "logs"
     formatter = RedactingFormatter(redactor)
-    for name in ("collection", "nessus", "certipy", "bloodhound", "pingcastle", "netexec"):
+    module_names = ("nessus", "certipy", "bloodhound", "pingcastle", "netexec", "ldap")
+    for name in ("collection", *module_names):
         logger = logging.getLogger(name)
         logger.handlers.clear()
         logger.setLevel(logging.DEBUG if debug else logging.INFO)
@@ -29,6 +30,6 @@ def configure_logging(root: Path, redactor: Redactor, debug: bool = False) -> lo
     # Also aggregate every module record into the main collection log.
     aggregate = logging.FileHandler(logs / "collection.log", encoding="utf-8")
     aggregate.setFormatter(formatter)
-    for name in ("nessus", "certipy", "bloodhound", "pingcastle", "netexec"):
+    for name in module_names:
         logging.getLogger(name).addHandler(aggregate)
     return logging.getLogger("collection")

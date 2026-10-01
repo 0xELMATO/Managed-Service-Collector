@@ -4,11 +4,26 @@ import json
 import logging
 import shutil
 import subprocess
+import re
 from pathlib import Path
 
 from .credentials import Redactor
 from .models import Credentials, ModuleResult
 from .utils import find_tool
+
+
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+SIGNING_DISABLED = re.compile(r"\bsigning\s*:\s*(?:false|disabled|no)\b", re.IGNORECASE)
+
+
+def filter_signing_disabled(output: str) -> str:
+    """Return only NetExec host result lines that report SMB signing disabled."""
+    matches = []
+    for line in output.splitlines():
+        clean_line = ANSI_ESCAPE.sub("", line)
+        if SIGNING_DISABLED.search(clean_line):
+            matches.append(clean_line)
+    return "\n".join(matches) + ("\n" if matches else "")
 
 
 class NetExecCollector:
@@ -40,8 +55,10 @@ class NetExecCollector:
             completed = subprocess.run(command, cwd=self.output, capture_output=True, text=True,
                                        errors="replace", timeout=1800, shell=False, stdin=subprocess.DEVNULL)
             cleaned = self.redactor.redact(completed.stdout + completed.stderr)
+            unsigned_only = filter_signing_disabled(cleaned)
             text_path = self.output / "smb_sweep.txt"
-            text_path.write_text(cleaned, encoding="utf-8")
+            text_path.write_text(unsigned_only, encoding="utf-8")
+            print(f"[+] SMB hosts with signing disabled: {len(unsigned_only.splitlines())}")
             help_text = subprocess.run([executable, "smb", "--help"], capture_output=True,
                                        text=True, timeout=15).stdout
             details: dict[str, object] = {"tool": executable, "native_json_supported": "--json" in help_text}
@@ -52,7 +69,7 @@ class NetExecCollector:
             else:
                 # Preserve a machine-readable record without re-running authentication.
                 json_path = self.output / "smb_sweep.json"
-                json_path.write_text(json.dumps({"raw_output": cleaned.splitlines()}, indent=2) + "\n")
+                json_path.write_text(json.dumps({"signing_disabled": unsigned_only.splitlines()}, indent=2) + "\n")
                 files.append(json_path)
             return ModuleResult(completed.returncode == 0,
                                 "" if completed.returncode == 0 else f"NetExec exited {completed.returncode}",

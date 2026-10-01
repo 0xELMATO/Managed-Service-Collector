@@ -33,15 +33,29 @@ def _powershell_error(stderr: bytes) -> str:
         return text
 
 
+def _pingcastle_failure(stdout: str) -> str:
+    """Detect known fatal PingCastle messages because some releases still exit 0."""
+    lowered = stdout.casefold()
+    if "could not query active directory" in lowered:
+        if "successful bind must be completed" in lowered:
+            return ("PingCastle could not bind to Active Directory. WinRM NTLM does not delegate the logon "
+                    "to LDAP; enable explicit PingCastle credentials or use a properly delegated Kerberos/CredSSP setup.")
+        return "PingCastle could not query Active Directory; review remote_execution.log for the directory error"
+    return ""
+
+
 class PingCastleCollector:
     """Run a PingCastle health check exclusively over a pywinrm session."""
 
     def __init__(self, output: Path, host: str, port: int, credentials: Credentials,
                  transport: str = "ntlm", verify_tls: bool = True, path: str = "",
-                 redactor: Redactor | None = None) -> None:
+                 redactor: Redactor | None = None, server: str = "",
+                 explicit_credentials: bool = True) -> None:
         self.output, self.host, self.port = output, host, port
         self.credentials, self.transport, self.verify_tls = credentials, transport, verify_tls
         self.requested_path, self.pingcastle_path = path, ""
+        self.server = server.strip()
+        self.explicit_credentials = explicit_credentials
         self.redactor = redactor or Redactor([credentials.username, credentials.password])
         self.remote_dir = rf"C:\Windows\Temp\assessment_collector_{uuid.uuid4().hex}"
         self.session: Any = None
@@ -65,7 +79,7 @@ class PingCastleCollector:
             raise RuntimeError("WinRM session is not connected")
         response = self.session.run_ps(script)
         if response.status_code not in acceptable:
-            error = _powershell_error(response.std_err)
+            error = self.redactor.redact(_powershell_error(response.std_err))
             suffix = f": {error}" if error else ""
             raise RuntimeError(f"Remote PowerShell failed with exit code {response.status_code}{suffix}")
         return response
@@ -109,8 +123,23 @@ class PingCastleCollector:
         help_text = (help_response.std_out + help_response.std_err).decode("utf-8", "replace")
         if "--healthcheck" not in help_text:
             raise RuntimeError("Installed PingCastle help does not advertise the read-only --healthcheck mode")
+        if not self.server:
+            raise RuntimeError("A PingCastle AD domain/server is required for the health check")
+        if "--server" not in help_text:
+            raise RuntimeError("Installed PingCastle help does not advertise the requested --server option")
+        credential_arguments = ""
+        if self.explicit_credentials:
+            if "--user" not in help_text or "--password" not in help_text:
+                raise RuntimeError(
+                    "Installed PingCastle cannot accept --user/--password; use Kerberos/CredSSP delegation "
+                    "or run PingCastle locally on the Windows host"
+                )
+            credential_arguments = (f" --user {_ps_quote(self.credentials.principal)}"
+                                    f" --password {_ps_quote(self.credentials.password)}")
         script = (f"$dir={_ps_quote(self.remote_dir)}; New-Item -ItemType Directory -Path $dir -ErrorAction Stop | Out-Null; "
-                  f"Push-Location $dir; & {exe} --healthcheck; $code=$LASTEXITCODE; Pop-Location; exit $code")
+                  f"Push-Location $dir; & {exe} --healthcheck --server {_ps_quote(self.server)}"
+                  f"{credential_arguments}; "
+                  "$code=$LASTEXITCODE; Pop-Location; exit $code")
         response = self._run(script, acceptable=tuple(range(256)))
         stdout = response.std_out.decode("utf-8", "replace")
         stderr = response.std_err.decode("utf-8", "replace")
@@ -118,11 +147,13 @@ class PingCastleCollector:
         (self.output / "remote_execution.log").write_text(self.redactor.redact(execution_log), encoding="utf-8")
         if response.status_code != 0:
             raise RuntimeError(f"PingCastle exited with code {response.status_code}")
+        if failure := _pingcastle_failure(stdout):
+            raise RuntimeError(failure)
         return response.status_code, stdout, stderr
 
     def collect_output(self) -> list[Path]:
-        listing = self._run(f"Get-ChildItem -LiteralPath {_ps_quote(self.remote_dir)} -File | "
-                            "Select-Object Name,Length | ConvertTo-Json -Compress")
+        listing = self._run(f"Get-ChildItem -LiteralPath {_ps_quote(self.remote_dir)} -File -Recurse | "
+                            "Select-Object Name,FullName,Length | ConvertTo-Json -Compress")
         raw = listing.std_out.decode("utf-8", "replace").strip()
         records = json.loads(raw) if raw else []
         if isinstance(records, dict):
@@ -136,7 +167,7 @@ class PingCastleCollector:
                 offset = 0
                 while offset < size:
                     count = min(384 * 1024, size - offset)
-                    remote_file = self.remote_dir + "\\" + name
+                    remote_file = str(record["FullName"])
                     script = (f"$f=[IO.File]::OpenRead({_ps_quote(remote_file)}); try{{$f.Position={offset};"
                               f"$b=New-Object byte[] {count};$n=$f.Read($b,0,$b.Length);"
                               "[Convert]::ToBase64String($b,0,$n)}finally{$f.Dispose()}")
@@ -177,7 +208,9 @@ class PingCastleCollector:
             self.cleanup()
             print("[+] PingCastle completed successfully")
             return ModuleResult(True, targets={"host": self.host, "port": str(self.port)},
-                                details={"transport": self.transport, "path": self.pingcastle_path}, files=files)
+                                details={"transport": self.transport, "path": self.pingcastle_path,
+                                         "server": self.server,
+                                         "explicit_credentials": self.explicit_credentials}, files=files)
         except Exception as exc:
             self.logger.error("PingCastle collection failed: %s", exc)
             return ModuleResult(False, str(exc), {"host": self.host, "port": str(self.port)}, files=files)
