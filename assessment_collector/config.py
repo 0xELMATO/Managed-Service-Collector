@@ -52,8 +52,8 @@ def credential_defaults(module_key: str) -> tuple[str, str, str]:
     return domain, username, password
 
 
-def configured_or_prompt(label: str, variable: str, default: str = "") -> str:
-    if variable in os.environ:
+def configured_or_prompt(label: str, variable: str, default: str = "", force_prompt: bool = False) -> str:
+    if not force_prompt and variable in os.environ:
         return env_text(variable)
     suffix = f" [{default}]" if default else ""
     return input(f"{label}{suffix}: ").strip() or default

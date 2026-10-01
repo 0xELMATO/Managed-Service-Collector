@@ -56,6 +56,19 @@ def test_ldap_checker_command_is_read_only(tmp_path: Path):
                        "-d", "ACME", "-M", "ldap-checker"]
 
 
+def test_ldap_report_keeps_only_signing_and_channel_binding():
+    from assessment_collector.ldap_security import filter_ldap_security_findings
+
+    output = ("LDAP 10.0.0.10 389 DC01 [*] Windows Server\n"
+              "\x1b[31mLDAP 10.0.0.10 389 DC01 LDAP signing is NOT enforced\x1b[0m\n"
+              "LDAP 10.0.0.10 389 DC01 Channel Binding is set to Never\n"
+              "LDAP 10.0.0.20 389 MEMBER Authentication succeeded\n")
+    assert filter_ldap_security_findings(output).splitlines() == [
+        "LDAP 10.0.0.10 389 DC01 LDAP signing is NOT enforced",
+        "LDAP 10.0.0.10 389 DC01 Channel Binding is set to Never",
+    ]
+
+
 def test_pingcastle_progress_clixml_is_not_reported_as_an_error():
     from assessment_collector.pingcastle import _powershell_error
 

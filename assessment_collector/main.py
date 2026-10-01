@@ -72,8 +72,27 @@ def choose_modules() -> list[str]:
             print("[!] Enter comma/space-separated choices (for example: 1,3,6), 7, or Q.")
 
 
+def choose_next_action(zip_disabled: bool = False) -> str:
+    """Ask whether to keep collecting or finalize the current assessment directory."""
+    if zip_disabled:
+        print("\n[1] Run another collection module\n[2] Finish (ZIP disabled by --no-zip)")
+        valid = {"1": "continue", "2": "finish"}
+    else:
+        print("\n[1] Run another collection module\n[2] Finish and ZIP everything\n[3] Finish without ZIP")
+        valid = {"1": "continue", "2": "zip", "3": "finish"}
+    while True:
+        choice = input("Select next action: ").strip()
+        if choice in valid:
+            return valid[choice]
+        print(f"[!] Enter one of: {', '.join(valid)}")
+
+
 def get_ad_credentials(cache: Credentials | None, module: str, module_key: str,
-                       redactor: Redactor) -> Credentials:
+                       redactor: Redactor, force_prompt: bool = False) -> Credentials:
+    if force_prompt:
+        credentials = prompt_credentials()
+        redactor.add(credentials.username, credentials.principal, credentials.password)
+        return credentials
     environment_configured = has_credential_environment(module_key)
     if cache and not environment_configured and yes_no(f"Reuse existing AD credentials for {module}?", True):
         return cache
@@ -87,23 +106,24 @@ def get_ad_credentials(cache: Credentials | None, module: str, module_key: str,
     return credentials
 
 
-def run_nessus(root: Path, redactor: Redactor) -> ModuleResult:
+def run_nessus(root: Path, redactor: Redactor, force_prompt: bool = False) -> ModuleResult:
     try:
         from .nessus import EXPORTS, NessusClient, NessusCollector
     except ImportError:
         return ModuleResult(False, "requests is not installed; run 'pip install requests'")
-    url = configured_or_prompt("Nessus URL (for example https://scanner:8834)", "MSC_NESSUS_URL")
-    configured_verify = env_bool("MSC_NESSUS_VERIFY_TLS")
+    url = configured_or_prompt("Nessus URL (for example https://scanner:8834)", "MSC_NESSUS_URL",
+                               force_prompt=force_prompt)
+    configured_verify = None if force_prompt else env_bool("MSC_NESSUS_VERIFY_TLS")
     verify = configured_verify if configured_verify is not None else not yes_no(
         "Disable TLS certificate verification?", False)
     if not verify:
         print("[!] WARNING: Nessus TLS certificate verification is disabled")
     client = NessusClient(url, verify_tls=verify)
     try:
-        access = env_secret("MSC_NESSUS_ACCESS_KEY")
-        secret = env_secret("MSC_NESSUS_SECRET_KEY")
-        username = env_text("MSC_NESSUS_USERNAME")
-        password = env_secret("MSC_NESSUS_PASSWORD")
+        access = "" if force_prompt else env_secret("MSC_NESSUS_ACCESS_KEY")
+        secret = "" if force_prompt else env_secret("MSC_NESSUS_SECRET_KEY")
+        username = "" if force_prompt else env_text("MSC_NESSUS_USERNAME")
+        password = "" if force_prompt else env_secret("MSC_NESSUS_PASSWORD")
         use_keys = bool(access or secret) or (not (username or password) and
                                               yes_no("Use Nessus API access/secret keys instead of a password?", True))
         if use_keys:
@@ -138,6 +158,70 @@ def run_nessus(root: Path, redactor: Redactor) -> ModuleResult:
         return ModuleResult(False, str(exc), {"url": url})
 
 
+def run_selected_module(module: str, root: Path, redactor: Redactor,
+                        cached: Credentials | None, force_prompt: bool = False) -> tuple[ModuleResult, Credentials | None]:
+    """Collect one module, optionally bypassing configured defaults during a retry."""
+    if module == "nessus":
+        return run_nessus(root, redactor, force_prompt), cached
+    if module == "certipy":
+        creds = get_ad_credentials(cached, "Certipy", "CERTIPY", redactor, force_prompt)
+        target = configured_or_prompt("Domain Controller / LDAP target", "MSC_CERTIPY_DC",
+                                      force_prompt=force_prompt)
+        return CertipyCollector(root / "certipy", redactor).collect(creds, target), creds
+    if module == "bloodhound":
+        creds = get_ad_credentials(cached, "BloodHound", "BLOODHOUND", redactor, force_prompt)
+        dc = configured_or_prompt("Domain Controller", "MSC_BLOODHOUND_DC", force_prompt=force_prompt)
+        name_server = configured_or_prompt("DNS name server/IP (optional)", "MSC_BLOODHOUND_NS",
+                                           force_prompt=force_prompt)
+        method = configured_or_prompt("Collection method", "MSC_BLOODHOUND_METHOD", "All", force_prompt)
+        return BloodHoundCollector(root / "bloodhound", redactor).collect(
+            creds, dc, method, name_server), creds
+    if module == "netexec":
+        creds = get_ad_credentials(cached, "NetExec", "NETEXEC", redactor, force_prompt)
+        scope_file = Path(configured_or_prompt("Path to scope.txt", "MSC_NETEXEC_SCOPE_FILE",
+                                               force_prompt=force_prompt))
+        return NetExecCollector(root / "netexec", redactor).collect(scope_file, creds), creds
+    if module == "ldap":
+        creds = get_ad_credentials(cached, "LDAP security checks", "LDAP", redactor, force_prompt)
+        specific_scope = env_text("MSC_LDAP_SCOPE_FILE") if not force_prompt else ""
+        use_different = bool(specific_scope)
+        if not specific_scope:
+            use_different = yes_no("Use a different scope file containing domain controllers?", False)
+        if use_different:
+            scope_file = Path(specific_scope or configured_or_prompt(
+                "Path to domain-controller scope file", "MSC_LDAP_SCOPE_FILE", force_prompt=True))
+        else:
+            collected_scope = root / "netexec" / "scope.txt"
+            scope_file = collected_scope if collected_scope.is_file() else Path(configured_or_prompt(
+                "Path to scope.txt", "MSC_NETEXEC_SCOPE_FILE", force_prompt=force_prompt))
+        return LdapSecurityCollector(root / "ldap", redactor).collect(scope_file, creds), creds
+
+    host = configured_or_prompt("PingCastle server IP/hostname", "MSC_PINGCASTLE_HOST",
+                                force_prompt=force_prompt)
+    configured_port = "" if force_prompt else env_text("MSC_PINGCASTLE_PORT")
+    if configured_port:
+        port = int(configured_port)
+    else:
+        mode = input("[1] WinRM HTTP - 5985\n[2] WinRM HTTPS - 5986\nCustom port\nSelect [2]: ").strip() or "2"
+        port = 5985 if mode == "1" else 5986 if mode == "2" else int(mode)
+    creds = get_ad_credentials(cached, "PingCastle", "PINGCASTLE", redactor, force_prompt)
+    transport = configured_or_prompt("Authentication transport [ntlm/kerberos]",
+                                     "MSC_PINGCASTLE_TRANSPORT", "ntlm", force_prompt)
+    path = configured_or_prompt("PingCastle path (optional)", "MSC_PINGCASTLE_PATH",
+                                force_prompt=force_prompt)
+    server = configured_or_prompt("PingCastle AD domain/server", "MSC_PINGCASTLE_SERVER",
+                                  creds.domain, force_prompt)
+    configured_explicit = None if force_prompt else env_bool("MSC_PINGCASTLE_EXPLICIT_CREDENTIALS")
+    explicit_credentials = configured_explicit if configured_explicit is not None else yes_no(
+        "Pass credentials to PingCastle for the LDAP bind (recommended for NTLM WinRM)?", True)
+    configured_verify = None if force_prompt else env_bool("MSC_PINGCASTLE_VERIFY_TLS")
+    verify = configured_verify if configured_verify is not None else (
+        True if port != 5986 else not yes_no("Ignore an untrusted WinRM HTTPS certificate?", False))
+    result = PingCastleCollector(root / "pingcastle", host, port, creds, transport,
+                                 verify, path, redactor, server, explicit_credentials).collect()
+    return result, creds
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Collect authorized security assessment evidence")
     result.add_argument("--output", type=Path, default=Path(env_text("MSC_OUTPUT", str(Path.cwd()))),
@@ -150,75 +234,60 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    selected = choose_modules()
-    if not selected:
+    pending = choose_modules()
+    if not pending:
         print("[*] No modules selected; exiting.")
         return 0
     started = datetime.now().astimezone()
     root = create_output_directory(args.output.expanduser().resolve(), started)
     redactor = Redactor()
     logger = configure_logging(root, redactor, args.debug)
-    logger.info("Collection started; selected modules: %s", ", ".join(selected))
-    show_dependencies(selected)
+    logger.info("Collection started")
     results: dict[str, ModuleResult] = {}
+    selected: list[str] = []
     cached: Credentials | None = None
+    create_zip = not args.no_zip
     try:
-        for module in selected:
-            print(f"\n[*] Running {module} module")
-            try:
-                if module == "nessus":
-                    result = run_nessus(root, redactor)
-                elif module == "certipy":
-                    creds = get_ad_credentials(cached, "Certipy", "CERTIPY", redactor); cached = cached or creds
-                    target = configured_or_prompt("Domain Controller / LDAP target", "MSC_CERTIPY_DC")
-                    result = CertipyCollector(root / "certipy", redactor).collect(creds, target)
-                elif module == "bloodhound":
-                    creds = get_ad_credentials(cached, "BloodHound", "BLOODHOUND", redactor); cached = cached or creds
-                    dc = configured_or_prompt("Domain Controller", "MSC_BLOODHOUND_DC")
-                    name_server = configured_or_prompt("DNS name server/IP (optional)", "MSC_BLOODHOUND_NS")
-                    method = configured_or_prompt("Collection method", "MSC_BLOODHOUND_METHOD", "All")
-                    result = BloodHoundCollector(root / "bloodhound", redactor).collect(
-                        creds, dc, method, name_server)
-                elif module == "netexec":
-                    creds = get_ad_credentials(cached, "NetExec", "NETEXEC", redactor); cached = cached or creds
-                    scope_file = Path(configured_or_prompt("Path to scope.txt", "MSC_NETEXEC_SCOPE_FILE"))
-                    result = NetExecCollector(root / "netexec", redactor).collect(scope_file, creds)
-                elif module == "ldap":
-                    creds = get_ad_credentials(cached, "LDAP security checks", "LDAP", redactor); cached = cached or creds
-                    target = configured_or_prompt("LDAP server / Domain Controller", "MSC_LDAP_TARGET")
-                    result = LdapSecurityCollector(root / "ldap", redactor).collect(target, creds)
-                else:
-                    host = configured_or_prompt("PingCastle server IP/hostname", "MSC_PINGCASTLE_HOST")
-                    configured_port = env_text("MSC_PINGCASTLE_PORT")
-                    if configured_port:
-                        port = int(configured_port)
-                    else:
-                        mode = input("[1] WinRM HTTP - 5985\n[2] WinRM HTTPS - 5986\nCustom port\nSelect [2]: ").strip() or "2"
-                        port = 5985 if mode == "1" else 5986 if mode == "2" else int(mode)
-                    creds = get_ad_credentials(cached, "PingCastle", "PINGCASTLE", redactor); cached = cached or creds
-                    transport = configured_or_prompt("Authentication transport [ntlm/kerberos]",
-                                                     "MSC_PINGCASTLE_TRANSPORT", "ntlm")
-                    path = configured_or_prompt("PingCastle path (optional)", "MSC_PINGCASTLE_PATH")
-                    server = configured_or_prompt("PingCastle AD domain/server", "MSC_PINGCASTLE_SERVER", creds.domain)
-                    configured_explicit = env_bool("MSC_PINGCASTLE_EXPLICIT_CREDENTIALS")
-                    explicit_credentials = configured_explicit if configured_explicit is not None else yes_no(
-                        "Pass credentials to PingCastle for the LDAP bind (recommended for NTLM WinRM)?", True)
-                    configured_verify = env_bool("MSC_PINGCASTLE_VERIFY_TLS")
-                    verify = configured_verify if configured_verify is not None else (
-                        True if port != 5986 else not yes_no("Ignore an untrusted WinRM HTTPS certificate?", False))
-                    result = PingCastleCollector(root / "pingcastle", host, port, creds, transport,
-                                                 verify, path, redactor, server, explicit_credentials).collect()
-            except Exception as exc:
-                logger.exception("Unhandled %s module error", module)
-                result = ModuleResult(False, str(exc))
-            results[module] = result
-            print("[+] SUCCESS" if result.success else f"[-] FAILED: {result.reason}")
+        while pending:
+            show_dependencies(pending)
+            logger.info("Selected modules: %s", ", ".join(pending))
+            for module in pending:
+                if module not in selected:
+                    selected.append(module)
+                print(f"\n[*] Running {module} module")
+                force_prompt = False
+                while True:
+                    try:
+                        result, used_credentials = run_selected_module(
+                            module, root, redactor, cached, force_prompt)
+                        if result.success and used_credentials is not None:
+                            cached = used_credentials
+                    except Exception as exc:
+                        logger.exception("Unhandled %s module error", module)
+                        result = ModuleResult(False, str(exc))
+                    print("[+] SUCCESS" if result.success else f"[-] FAILED: {result.reason}")
+                    if result.success or not yes_no(
+                            f"Retry {module} with newly prompted settings/credentials?", True):
+                        break
+                    force_prompt = True
+                    print(f"[*] Retrying {module}; configured environment defaults will be bypassed")
+                results[module] = result
+            action = choose_next_action(args.no_zip)
+            if action == "continue":
+                pending = choose_modules()
+                if pending:
+                    continue
+            elif action == "finish":
+                create_zip = False
+            else:
+                create_zip = True
+            break
     except KeyboardInterrupt:
         print("\n[!] Interrupted; finalizing evidence collected so far.")
         logger.warning("Collection interrupted by operator")
     finally:
         write_manifest(root, started.isoformat(), selected, results)
-        archive = None if args.no_zip else create_archive(root)
+        archive = create_archive(root) if create_zip else None
         logger.info("Collection ended")
     print("\n=== Collection Summary ===\n")
     for name in selected:

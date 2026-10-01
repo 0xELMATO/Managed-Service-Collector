@@ -2,10 +2,10 @@ from pathlib import Path
 
 import pytest
 
-from assessment_collector.config import (ConfigurationError, credential_defaults,
-                                         env_bool, env_secret)
+from assessment_collector.config import (ConfigurationError, configured_or_prompt,
+                                         credential_defaults, env_bool, env_secret)
 from assessment_collector.credentials import Redactor
-from assessment_collector.main import get_ad_credentials
+from assessment_collector.main import choose_next_action, get_ad_credentials
 
 
 def test_module_credentials_override_shared_environment(monkeypatch):
@@ -44,3 +44,21 @@ def test_complete_environment_credentials_do_not_prompt(monkeypatch):
     monkeypatch.setattr("getpass.getpass", lambda *_: pytest.fail("password prompt was called"))
     credentials = get_ad_credentials(None, "Certipy", "CERTIPY", Redactor())
     assert credentials.principal == r"AD.EXAMPLE\auditor"
+
+
+@pytest.mark.parametrize(("choice", "expected"), [("1", "continue"), ("2", "zip"), ("3", "finish")])
+def test_next_action_menu(monkeypatch, choice, expected):
+    monkeypatch.setattr("builtins.input", lambda *_: choice)
+    assert choose_next_action() == expected
+
+
+def test_no_zip_next_action_has_no_zip_choice(monkeypatch):
+    answers = iter(["3", "2"])
+    monkeypatch.setattr("builtins.input", lambda *_: next(answers))
+    assert choose_next_action(zip_disabled=True) == "finish"
+
+
+def test_force_prompt_bypasses_invalid_environment_default(monkeypatch):
+    monkeypatch.setenv("MSC_NETEXEC_SCOPE_FILE", "/missing/scope.txt")
+    monkeypatch.setattr("builtins.input", lambda *_: "/correct/scope.txt")
+    assert configured_or_prompt("Scope", "MSC_NETEXEC_SCOPE_FILE", force_prompt=True) == "/correct/scope.txt"
