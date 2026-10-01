@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import logging
 import time
+import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import requests
+from urllib3.exceptions import InsecureRequestWarning
 
 from .models import ModuleResult
 from .utils import sanitize_filename, unique_path
@@ -44,8 +47,15 @@ class NessusClient:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
         try:
-            response = self.session.request(method, f"{self.base_url}{path}", verify=self.verify_tls,
-                                            timeout=self.timeout, **kwargs)
+            # The operator has already received an explicit warning before opting out
+            # of certificate validation.  Suppress urllib3's duplicate warning only
+            # for this request rather than changing the process-wide warning policy.
+            warning_scope = warnings.catch_warnings() if not self.verify_tls else nullcontext()
+            with warning_scope:
+                if not self.verify_tls:
+                    warnings.simplefilter("ignore", InsecureRequestWarning)
+                response = self.session.request(method, f"{self.base_url}{path}", verify=self.verify_tls,
+                                                timeout=self.timeout, **kwargs)
             response.raise_for_status()
             return response
         except requests.RequestException as exc:

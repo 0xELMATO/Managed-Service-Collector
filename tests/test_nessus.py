@@ -1,8 +1,10 @@
 from pathlib import Path
 from unittest.mock import Mock, patch
+import warnings
 
 import pytest
 import requests
+from urllib3.exceptions import InsecureRequestWarning
 
 from assessment_collector.nessus import EXPORTS, NessusClient, NessusError
 
@@ -33,3 +35,29 @@ def test_export_polling_waits_until_ready(_sleep):
 def test_export_payloads_include_two_pdf_layouts():
     assert EXPORTS["pdf_host"].payload["chapters"] == "vuln_hosts_summary"
     assert EXPORTS["pdf_plugin"].payload["chapters"] == "vuln_by_plugin"
+
+
+def test_insecure_request_warning_is_scoped_and_suppressed():
+    session = Mock()
+
+    def emit_warning(*_args, **_kwargs):
+        warnings.warn("unverified", InsecureRequestWarning)
+        return response({"scans": []})
+
+    session.request.side_effect = emit_warning
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert NessusClient("https://nessus", verify_tls=False, session=session).list_scans() == []
+    assert caught == []
+
+
+def test_other_warning_categories_are_not_suppressed():
+    session = Mock()
+
+    def emit_warning(*_args, **_kwargs):
+        warnings.warn("application warning", RuntimeWarning)
+        return response({"scans": []})
+
+    session.request.side_effect = emit_warning
+    with pytest.warns(RuntimeWarning, match="application warning"):
+        NessusClient("https://nessus", verify_tls=False, session=session).list_scans()
