@@ -132,18 +132,14 @@ def run_nessus(root: Path, redactor: Redactor, force_prompt: bool = False) -> Mo
         "Disable TLS certificate verification?", False)
     if not verify:
         print("[!] WARNING: Nessus TLS certificate verification is disabled")
-    remember_setting("MSC_NESSUS_VERIFY_TLS", str(verify).lower())
     client = NessusClient(url, verify_tls=verify)
     try:
         access = "" if force_prompt else env_secret("MSC_NESSUS_ACCESS_KEY")
         secret = "" if force_prompt else env_secret("MSC_NESSUS_SECRET_KEY")
         username = "" if force_prompt else env_text("MSC_NESSUS_USERNAME")
         password = "" if force_prompt else env_secret("MSC_NESSUS_PASSWORD")
-        configured_auth = "" if force_prompt else env_text("MSC_NESSUS_AUTH").casefold()
-        use_keys = (configured_auth == "keys" or bool(access or secret) or
-                    (configured_auth != "password" and not (username or password) and
-                     yes_no("Use Nessus API access/secret keys instead of a password?", True)))
-        remember_setting("MSC_NESSUS_AUTH", "keys" if use_keys else "password")
+        use_keys = bool(access or secret) or (not (username or password) and
+                                              yes_no("Use Nessus API access/secret keys instead of a password?", True))
         if use_keys:
             access = access or getpass.getpass("Nessus access key: ")
             secret = secret or getpass.getpass("Nessus secret key: ")
