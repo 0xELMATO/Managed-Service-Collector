@@ -44,6 +44,14 @@ def _pingcastle_failure(stdout: str) -> str:
     return ""
 
 
+def _execution_diagnostic(stdout: str, stderr: str) -> str:
+    """Return the last useful PingCastle output without PowerShell progress noise."""
+    useful_stderr = _powershell_error(stderr.encode("utf-8", "replace"))
+    lines = [line.strip() for line in (stdout + "\n" + useful_stderr).splitlines()
+             if line.strip() and not line.startswith("#< CLIXML")]
+    return " | ".join(lines[-6:])[:1200]
+
+
 class PingCastleCollector:
     """Run a PingCastle health check exclusively over a pywinrm session."""
 
@@ -145,17 +153,43 @@ class PingCastleCollector:
                     "PingCastle help did not expose user/password; using the version-4 compatibility syntax")
             credential_arguments = (f" --user {_ps_quote(self.credentials.principal)}"
                                     f" --password {_ps_quote(self.credentials.password)}")
-        script = (f"$dir={_ps_quote(self.remote_dir)}; New-Item -ItemType Directory -Path $dir -ErrorAction Stop | Out-Null; "
-                  f"Push-Location $dir; & {exe} --healthcheck --server {_ps_quote(self.server)}"
-                  f"{credential_arguments}; "
-                  "$code=$LASTEXITCODE; Pop-Location; exit $code")
-        response = self._run(script, acceptable=tuple(range(256)))
+        prefix = (f"$dir={_ps_quote(self.remote_dir)}; New-Item -ItemType Directory -Path $dir "
+                  "-Force -ErrorAction Stop | Out-Null; Push-Location $dir; ")
+
+        def invoke(arguments: str) -> Any:
+            script = (prefix + f"& {exe} --healthcheck --server {_ps_quote(self.server)}{arguments}; "
+                      "$code=$LASTEXITCODE; Pop-Location; exit $code")
+            return self._run(script, acceptable=tuple(range(256)))
+
+        attempts: list[tuple[str, Any]] = []
+        response = invoke(credential_arguments)
+        attempts.append(("explicit credentials" if credential_arguments else "WinRM identity", response))
+        # PingCastle 4 builds can return code 6 when their credential switches are unavailable even
+        # though --healthcheck --server works. Match the operator-tested command as a compatibility
+        # fallback; a resulting LDAP delegation failure is detected below and reported explicitly.
+        if response.status_code == 6 and credential_arguments:
+            self.logger.warning("PingCastle rejected explicit credentials with code 6; retrying with WinRM identity")
+            print("[!] PingCastle rejected explicit credential arguments; retrying with the WinRM identity")
+            response = invoke("")
+            attempts.append(("WinRM identity compatibility retry", response))
+
         stdout = response.std_out.decode("utf-8", "replace")
         stderr = response.std_err.decode("utf-8", "replace")
-        execution_log = f"exit_code={response.status_code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        log_parts = []
+        for label, attempt in attempts:
+            attempt_stdout = attempt.std_out.decode("utf-8", "replace")
+            attempt_stderr = attempt.std_err.decode("utf-8", "replace")
+            log_parts.append(f"attempt={label}\nexit_code={attempt.status_code}\n"
+                             f"--- stdout ---\n{attempt_stdout}\n--- stderr ---\n{attempt_stderr}")
+        execution_log = "\n\n".join(log_parts)
         (self.output / "remote_execution.log").write_text(self.redactor.redact(execution_log), encoding="utf-8")
         if response.status_code != 0:
-            raise RuntimeError(f"PingCastle exited with code {response.status_code}")
+            diagnostic = self.redactor.redact(_execution_diagnostic(stdout, stderr))
+            detail = f": {diagnostic}" if diagnostic else ""
+            raise RuntimeError(
+                f"PingCastle exited with code {response.status_code}{detail}. "
+                "See pingcastle/remote_execution.log for the complete redacted output."
+            )
         if failure := _pingcastle_failure(stdout):
             raise RuntimeError(failure)
         return response.status_code, stdout, stderr
@@ -214,7 +248,6 @@ class PingCastleCollector:
             self.execute_pingcastle()
             files = self.collect_output()
             files.append(self.output / "remote_execution.log")
-            self.cleanup()
             print("[+] PingCastle completed successfully")
             return ModuleResult(True, targets={"host": self.host, "port": str(self.port)},
                                 details={"transport": self.transport, "path": self.pingcastle_path,
@@ -222,6 +255,14 @@ class PingCastleCollector:
                                          "explicit_credentials": self.explicit_credentials}, files=files)
         except Exception as exc:
             self.logger.error("PingCastle collection failed: %s", exc)
+            for diagnostic in (self.output / "pingcastle_help.txt", self.output / "remote_execution.log"):
+                if diagnostic.is_file() and diagnostic not in files:
+                    files.append(diagnostic)
             return ModuleResult(False, str(exc), {"host": self.host, "port": str(self.port)}, files=files)
         finally:
+            if self.session is not None:
+                try:
+                    self.cleanup()
+                except Exception as cleanup_error:
+                    self.logger.warning("Could not clean PingCastle temporary directory: %s", cleanup_error)
             self.disconnect()

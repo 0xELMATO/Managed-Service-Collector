@@ -119,6 +119,50 @@ def test_pingcastle_uses_compatibility_syntax_when_help_is_incomplete(tmp_path: 
     assert any("--healthcheck --server 'domain.local'" in script for script in scripts)
 
 
+def test_pingcastle_code_six_retries_without_explicit_credentials(tmp_path: Path):
+    from types import SimpleNamespace
+
+    collector = PingCastleCollector(tmp_path, "runner", 5985, Credentials("ACME", "audit", "pw"),
+                                    path=r"C:\PingCastle\PingCastle.exe", server="domain.local")
+    collector.pingcastle_path = collector.requested_path
+    scripts = []
+
+    class Session:
+        def run_ps(self, script):
+            scripts.append(script)
+            if "--healthcheck" in script and "--password" in script:
+                return SimpleNamespace(status_code=6, std_out=b"Unsupported credential option", std_err=b"")
+            return SimpleNamespace(status_code=0, std_out=b"Export completed", std_err=b"")
+
+    collector.session = Session()
+    collector.execute_pingcastle()
+    healthchecks = [script for script in scripts if "--healthcheck" in script]
+    assert len(healthchecks) == 2
+    assert "--password" in healthchecks[0]
+    assert "--password" not in healthchecks[1]
+    log = (tmp_path / "remote_execution.log").read_text()
+    assert "exit_code=6" in log and "exit_code=0" in log and "pw" not in log
+
+
+def test_pingcastle_nonzero_error_contains_redacted_diagnostic(tmp_path: Path):
+    from types import SimpleNamespace
+
+    collector = PingCastleCollector(tmp_path, "runner", 5985, Credentials("ACME", "audit", "secret"),
+                                    path=r"C:\PingCastle\PingCastle.exe", server="domain.local",
+                                    explicit_credentials=False)
+    collector.pingcastle_path = collector.requested_path
+
+    class Session:
+        def run_ps(self, script):
+            if "--healthcheck" in script:
+                return SimpleNamespace(status_code=7, std_out=b"LDAP failed for secret", std_err=b"")
+            return SimpleNamespace(status_code=0, std_out=b"--healthcheck --server", std_err=b"")
+
+    collector.session = Session()
+    with pytest.raises(RuntimeError, match=r"code 7: LDAP failed for \[REDACTED\]"):
+        collector.execute_pingcastle()
+
+
 def test_pingcastle_detects_exit_zero_ldap_bind_failure():
     from assessment_collector.pingcastle import _pingcastle_failure
 
