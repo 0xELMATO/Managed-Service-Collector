@@ -4,15 +4,51 @@ import hashlib
 import json
 import re
 import shutil
+import unicodedata
 import zipfile
 from datetime import datetime
 from pathlib import Path
 
 
+WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
 def sanitize_filename(name: str, fallback: str = "unnamed", max_length: int = 120) -> str:
-    value = re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "_", name).strip(" ._")
+    """Return a portable Windows/Linux filename while retaining readable punctuation."""
+    value = unicodedata.normalize("NFKC", name)
+    value = re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "_", value).strip(" ._")
     value = re.sub(r"\s+", "_", value)
-    return (value[:max_length].rstrip(" ._") or fallback)
+    value = value[:max_length].rstrip(" ._") or fallback
+    if value.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES:
+        value = f"_{value}"
+    return value
+
+
+def windows_safe_path_name(name: str, max_length: int = 120) -> str:
+    path = Path(name)
+    suffix = "".join(path.suffixes)
+    stem = name[:-len(suffix)] if suffix else name
+    safe_suffix = re.sub(r"[^A-Za-z0-9._-]", "_", suffix)[:20]
+    return sanitize_filename(stem, max_length=max(1, max_length - len(safe_suffix))) + safe_suffix
+
+
+def normalize_output_tree(root: Path) -> list[tuple[Path, Path]]:
+    """Rename collector-generated entries to portable names, deepest entries first."""
+    renamed: list[tuple[Path, Path]] = []
+    entries = sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True)
+    for path in entries:
+        if not path.exists():
+            continue
+        safe_name = windows_safe_path_name(path.name) if path.is_file() else sanitize_filename(path.name)
+        if safe_name == path.name:
+            continue
+        destination = unique_path(path.with_name(safe_name))
+        path.rename(destination)
+        renamed.append((path, destination))
+    return renamed
 
 
 def unique_path(path: Path) -> Path:

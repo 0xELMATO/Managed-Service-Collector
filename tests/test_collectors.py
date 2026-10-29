@@ -101,6 +101,24 @@ def test_pingcastle_healthcheck_includes_server(tmp_path: Path):
     assert "pw" not in (tmp_path / "remote_execution.log").read_text()
 
 
+def test_pingcastle_uses_compatibility_syntax_when_help_is_incomplete(tmp_path: Path):
+    from types import SimpleNamespace
+
+    collector = PingCastleCollector(tmp_path, "runner", 5985, Credentials("ACME", "audit", "pw"),
+                                    path=r"C:\PingCastle\PingCastle.exe", server="domain.local")
+    collector.pingcastle_path = collector.requested_path
+    scripts = []
+
+    class Session:
+        def run_ps(self, script):
+            scripts.append(script)
+            return SimpleNamespace(status_code=0, std_out=b"", std_err=b"")
+
+    collector.session = Session()
+    collector.execute_pingcastle()
+    assert any("--healthcheck --server 'domain.local'" in script for script in scripts)
+
+
 def test_pingcastle_detects_exit_zero_ldap_bind_failure():
     from assessment_collector.pingcastle import _pingcastle_failure
 

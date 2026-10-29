@@ -3,7 +3,9 @@ from pathlib import Path
 import pytest
 
 from assessment_collector.config import (ConfigurationError, configured_or_prompt,
-                                         credential_defaults, env_bool, env_secret)
+                                         credential_defaults, env_bool, env_secret,
+                                         load_saved_settings, remember_setting,
+                                         save_session_settings)
 from assessment_collector.credentials import Redactor
 from assessment_collector.main import choose_next_action, get_ad_credentials
 
@@ -62,3 +64,18 @@ def test_force_prompt_bypasses_invalid_environment_default(monkeypatch):
     monkeypatch.setenv("MSC_NETEXEC_SCOPE_FILE", "/missing/scope.txt")
     monkeypatch.setattr("builtins.input", lambda *_: "/correct/scope.txt")
     assert configured_or_prompt("Scope", "MSC_NETEXEC_SCOPE_FILE", force_prompt=True) == "/correct/scope.txt"
+
+
+def test_saved_settings_never_include_secrets(tmp_path: Path, monkeypatch):
+    from assessment_collector import config
+
+    config._SESSION_SETTINGS.clear()
+    remember_setting("MSC_AD_USERNAME", "auditor")
+    remember_setting("MSC_AD_PASSWORD", "must-not-save")
+    path = save_session_settings(tmp_path / "config.json")
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert "auditor" in path.read_text()
+    assert "must-not-save" not in path.read_text()
+    monkeypatch.delenv("MSC_AD_USERNAME", raising=False)
+    load_saved_settings(path)
+    assert __import__("os").environ["MSC_AD_USERNAME"] == "auditor"

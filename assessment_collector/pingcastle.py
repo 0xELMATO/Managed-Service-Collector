@@ -119,21 +119,30 @@ class PingCastleCollector:
 
     def execute_pingcastle(self) -> tuple[int, str, str]:
         exe = _ps_quote(self.pingcastle_path)
-        help_response = self._run(f"& {exe} --help", acceptable=tuple(range(256)))
-        help_text = (help_response.std_out + help_response.std_err).decode("utf-8", "replace")
-        if "--healthcheck" not in help_text:
-            raise RuntimeError("Installed PingCastle help does not advertise the read-only --healthcheck mode")
+        help_chunks: list[str] = []
+        for help_argument in ("--help", "-h", "/?"):
+            help_response = self._run(f"& {exe} {help_argument}", acceptable=tuple(range(256)))
+            chunk = (help_response.std_out + help_response.std_err).decode("utf-8", "replace")
+            if chunk:
+                help_chunks.append(chunk)
+            lowered = chunk.casefold()
+            if "healthcheck" in lowered and "server" in lowered:
+                break
+        help_text = "\n".join(help_chunks)
+        (self.output / "pingcastle_help.txt").write_text(
+            self.redactor.redact(help_text), encoding="utf-8")
+        help_lower = help_text.casefold()
+        if "healthcheck" not in help_lower or "server" not in help_lower:
+            self.logger.warning(
+                "PingCastle help did not expose healthcheck/server; using the version-4 compatibility syntax")
+            print("[!] PingCastle help output was incomplete; trying compatible --healthcheck --server syntax")
         if not self.server:
             raise RuntimeError("A PingCastle AD domain/server is required for the health check")
-        if "--server" not in help_text:
-            raise RuntimeError("Installed PingCastle help does not advertise the requested --server option")
         credential_arguments = ""
         if self.explicit_credentials:
-            if "--user" not in help_text or "--password" not in help_text:
-                raise RuntimeError(
-                    "Installed PingCastle cannot accept --user/--password; use Kerberos/CredSSP delegation "
-                    "or run PingCastle locally on the Windows host"
-                )
+            if "--user" not in help_lower or "--password" not in help_lower:
+                self.logger.warning(
+                    "PingCastle help did not expose user/password; using the version-4 compatibility syntax")
             credential_arguments = (f" --user {_ps_quote(self.credentials.principal)}"
                                     f" --password {_ps_quote(self.credentials.password)}")
         script = (f"$dir={_ps_quote(self.remote_dir)}; New-Item -ItemType Directory -Path $dir -ErrorAction Stop | Out-Null; "

@@ -6,21 +6,25 @@ import logging
 import importlib.util
 import shutil
 import sys
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
 from . import __version__
 from .bloodhound import BloodHoundCollector
 from .certipy import CertipyCollector
+from .comparison import compare_assessments, write_comparison
 from .config import (configured_or_prompt, credential_defaults, env_bool, env_secret,
-                     env_text, has_credential_environment)
+                     env_text, has_credential_environment, load_saved_settings,
+                     remember_setting, save_session_settings)
 from .credentials import Redactor, prompt_credentials
 from .logging_setup import configure_logging
 from .ldap_security import LdapSecurityCollector
 from .models import Credentials, ModuleResult
 from .netexec import NetExecCollector
 from .pingcastle import PingCastleCollector
-from .utils import create_archive, create_output_directory, parse_selection, write_manifest
+from .utils import (create_archive, create_output_directory, normalize_output_tree,
+                    parse_selection, write_manifest)
 
 MODULES = {1: "nessus", 2: "certipy", 3: "bloodhound", 4: "pingcastle", 5: "netexec", 6: "ldap"}
 
@@ -91,10 +95,16 @@ def get_ad_credentials(cache: Credentials | None, module: str, module_key: str,
                        redactor: Redactor, force_prompt: bool = False) -> Credentials:
     if force_prompt:
         credentials = prompt_credentials()
+        remember_setting("MSC_AD_DOMAIN", credentials.domain)
+        remember_setting("MSC_AD_USERNAME", credentials.username)
+        remember_setting(f"MSC_{module_key}_DOMAIN", credentials.domain)
+        remember_setting(f"MSC_{module_key}_USERNAME", credentials.username)
         redactor.add(credentials.username, credentials.principal, credentials.password)
         return credentials
     environment_configured = has_credential_environment(module_key)
     if cache and not environment_configured and yes_no(f"Reuse existing AD credentials for {module}?", True):
+        remember_setting("MSC_AD_DOMAIN", cache.domain)
+        remember_setting("MSC_AD_USERNAME", cache.username)
         return cache
     domain, username, password = credential_defaults(module_key)
     if cache:
@@ -102,6 +112,10 @@ def get_ad_credentials(cache: Credentials | None, module: str, module_key: str,
         username = username or cache.username
         password = password or cache.password
     credentials = prompt_credentials(domain=domain, username=username, password=password)
+    remember_setting("MSC_AD_DOMAIN", credentials.domain)
+    remember_setting("MSC_AD_USERNAME", credentials.username)
+    remember_setting(f"MSC_{module_key}_DOMAIN", credentials.domain)
+    remember_setting(f"MSC_{module_key}_USERNAME", credentials.username)
     redactor.add(credentials.username, credentials.principal, credentials.password)
     return credentials
 
@@ -134,6 +148,7 @@ def run_nessus(root: Path, redactor: Redactor, force_prompt: bool = False) -> Mo
         else:
             username = username or input("Nessus username: ").strip()
             password = password or getpass.getpass("Nessus password: ")
+            remember_setting("MSC_NESSUS_USERNAME", username)
             redactor.add(username, password)
             client.authenticate_password(username, password)
         print("[+] Authenticated to Nessus")
@@ -204,6 +219,7 @@ def run_selected_module(module: str, root: Path, redactor: Redactor,
     else:
         mode = input("[1] WinRM HTTP - 5985\n[2] WinRM HTTPS - 5986\nCustom port\nSelect [2]: ").strip() or "2"
         port = 5985 if mode == "1" else 5986 if mode == "2" else int(mode)
+    remember_setting("MSC_PINGCASTLE_PORT", str(port))
     creds = get_ad_credentials(cached, "PingCastle", "PINGCASTLE", redactor, force_prompt)
     transport = configured_or_prompt("Authentication transport [ntlm/kerberos]",
                                      "MSC_PINGCASTLE_TRANSPORT", "ntlm", force_prompt)
@@ -214,9 +230,11 @@ def run_selected_module(module: str, root: Path, redactor: Redactor,
     configured_explicit = None if force_prompt else env_bool("MSC_PINGCASTLE_EXPLICIT_CREDENTIALS")
     explicit_credentials = configured_explicit if configured_explicit is not None else yes_no(
         "Pass credentials to PingCastle for the LDAP bind (recommended for NTLM WinRM)?", True)
+    remember_setting("MSC_PINGCASTLE_EXPLICIT_CREDENTIALS", str(explicit_credentials).lower())
     configured_verify = None if force_prompt else env_bool("MSC_PINGCASTLE_VERIFY_TLS")
     verify = configured_verify if configured_verify is not None else (
         True if port != 5986 else not yes_no("Ignore an untrusted WinRM HTTPS certificate?", False))
+    remember_setting("MSC_PINGCASTLE_VERIFY_TLS", str(verify).lower())
     result = PingCastleCollector(root / "pingcastle", host, port, creds, transport,
                                  verify, path, redactor, server, explicit_credentials).collect()
     return result, creds
@@ -228,12 +246,37 @@ def parser() -> argparse.ArgumentParser:
                         help="parent output directory (default: MSC_OUTPUT or current directory)")
     result.add_argument("--no-zip", action="store_true", help="do not create the final ZIP archive")
     result.add_argument("--debug", action="store_true", help="enable debug file logging")
+    result.add_argument("--no-save-settings", action="store_true",
+                        help="do not offer to save non-secret settings for future runs")
+    result.add_argument("--compare-with", type=Path,
+                        help="compare the completed run with a previous assessment directory or ZIP")
+    result.add_argument("--compare-only", type=Path, nargs=2, metavar=("PREVIOUS", "CURRENT"),
+                        help="compare two existing assessment directories/ZIPs without collecting")
+    result.add_argument("--comparison-output", type=Path, default=Path.cwd(),
+                        help="output directory for --compare-only reports (default: current directory)")
     result.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
+    saved_config_path = load_saved_settings()
     args = parser().parse_args(argv)
+    if args.compare_only:
+        previous, current = args.compare_only
+        try:
+            comparison = compare_assessments(previous, current)
+            json_path, text_path = write_comparison(
+                comparison, args.comparison_output.expanduser().resolve()
+            )
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            print(f"[-] Assessment comparison failed: {exc}", file=sys.stderr)
+            return 2
+        summary = comparison["summary"]
+        print(f"[+] Comparison complete: {summary['added']} added, {summary['removed']} removed, "
+              f"{summary['changed']} changed, {summary['unchanged']} unchanged")
+        print(f"[+] Reports: {text_path} and {json_path}")
+        return 0
+    remember_setting("MSC_OUTPUT", str(args.output.expanduser().resolve()))
     pending = choose_modules()
     if not pending:
         print("[*] No modules selected; exiting.")
@@ -286,6 +329,29 @@ def main(argv: list[str] | None = None) -> int:
         print("\n[!] Interrupted; finalizing evidence collected so far.")
         logger.warning("Collection interrupted by operator")
     finally:
+        if not args.no_save_settings and yes_no(
+                f"Save non-secret hosts, usernames, domains, and paths to {saved_config_path} for future runs?", False):
+            saved_path = save_session_settings(saved_config_path)
+            print(f"[+] Saved non-secret settings: {saved_path}")
+        renamed = normalize_output_tree(root)
+        if renamed:
+            logger.info("Normalized %d output names for Windows compatibility", len(renamed))
+        configured_comparison = env_text("MSC_COMPARE_WITH")
+        compare_with = args.compare_with or (Path(configured_comparison)
+                                             if configured_comparison else None)
+        if compare_with is None and yes_no("Compare this run with a previous assessment?", False):
+            compare_with = Path(input("Previous assessment directory or ZIP: ").strip())
+        if compare_with is not None:
+            try:
+                comparison = compare_assessments(compare_with, root)
+                json_path, text_path = write_comparison(comparison, root)
+                summary = comparison["summary"]
+                print(f"[+] Comparison: {summary['added']} added, {summary['removed']} removed, "
+                      f"{summary['changed']} changed, {summary['unchanged']} unchanged")
+                print(f"[+] Comparison reports: {text_path.name}, {json_path.name}")
+            except (OSError, ValueError, zipfile.BadZipFile) as exc:
+                logger.error("Assessment comparison failed: %s", exc)
+                print(f"[!] Assessment comparison failed: {exc}")
         write_manifest(root, started.isoformat(), selected, results)
         archive = create_archive(root) if create_zip else None
         logger.info("Collection ended")

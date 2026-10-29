@@ -32,6 +32,14 @@ def test_export_polling_waits_until_ready(_sleep):
     assert session.request.call_count == 2
 
 
+@patch("assessment_collector.nessus.time.sleep", return_value=None)
+def test_export_polling_retries_transient_server_error(_sleep):
+    session = Mock()
+    session.request.side_effect = [response(status=500), response({"status": "ready"})]
+    NessusClient("https://nessus", session=session).wait_for_export(170, 1047954425, poll_interval=0)
+    assert session.request.call_count == 2
+
+
 def test_export_payloads_include_two_pdf_layouts():
     assert EXPORTS["pdf_host"].payload["chapters"] == "vuln_hosts_summary"
     assert EXPORTS["pdf_plugin"].payload["chapters"] == "vuln_by_plugin"

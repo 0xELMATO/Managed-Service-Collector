@@ -33,6 +33,9 @@ python3 assessment_collector.py
 python3 assessment_collector.py --output ./assessments
 python3 assessment_collector.py --no-zip
 python3 assessment_collector.py --debug
+python3 assessment_collector.py --no-save-settings
+python3 assessment_collector.py --compare-with ./assessment_previous
+python3 assessment_collector.py --compare-only ./assessment_previous.zip ./assessment_current
 python3 assessment_collector.py --version
 ```
 
@@ -46,6 +49,23 @@ After the selected module or batch completes, the same timestamped assessment re
 [3] Finish without ZIP
 ```
 
+## Comparing assessment runs
+
+At finalization the collector asks whether to compare the new evidence with a previous assessment directory or ZIP. You can also provide the previous run up front with `--compare-with`. For existing evidence, `--compare-only PREVIOUS CURRENT` performs a standalone comparison and writes `comparison.json` plus a readable `comparison.txt` to the current directory; use `--comparison-output` to select another destination.
+
+The comparison is semantic where the format permits it, specifically to avoid reporting a change just because output moved to another line:
+
+* JSON object keys and array entries are compared without ordering.
+* CSV rows and columns are compared without ordering, while duplicate rows are still counted.
+* XML and `.nessus` elements are compared without child ordering or insignificant whitespace.
+* Text and log-like evidence is compared as a multiset of normalized lines, so reordered lines are unchanged but added, removed, or duplicated lines are detected.
+* ZIP members are compared recursively; common timestamp prefixes on generated member names are ignored.
+* PDF and unknown binary formats use SHA-256 and are marked changed when their bytes differ.
+
+Operational logs, manifests, and older comparison reports are excluded. The reports group evidence into `added`, `removed`, `changed`, and `unchanged`. This is a deterministic triage aid, not a replacement for reviewing the underlying security findings or understanding tool-version/schema changes.
+
+For automation, set `MSC_COMPARE_WITH` to the previous assessment directory or ZIP. Changed text/CSV evidence includes added and removed records in the reports, and changed JSON includes the affected JSON paths; these details are capped to keep reports manageable.
+
 ## Configuration and permissions
 
 There is intentionally no credential configuration file.
@@ -53,6 +73,8 @@ There is intentionally no credential configuration file.
 ### Environment variables
 
 Every configured value is checked before an interactive prompt. Export variables in the current terminal, place them in a protected launcher/service environment, or prefix them on the command invocation. Do **not** commit secrets to shell profiles, `.env` files, source control, or shell scripts. Interactive `getpass` entry remains the safest default. For automation, prefer the `*_PASSWORD_FILE`, `*_ACCESS_KEY_FILE`, and `*_SECRET_KEY_FILE` variants pointing to owner-readable files (for example, mode `0600`) over direct secret environment variables.
+
+At finalization the collector asks whether to save non-secret settings for future runs. If accepted, it writes hosts, usernames, domains, ports, paths, and similar values to `~/.config/managed-service-collector/config.json` with mode `0600`. Passwords, API keys, tokens, and secret-file contents are never written. On later runs these settings are loaded before prompting, so normally only passwords are requested. Explicit environment variables still take precedence. Set `MSC_CONFIG_FILE` to move the profile, or use `--no-save-settings` to suppress the save prompt.
 
 ```bash
 # Shared AD defaults used by Certipy, BloodHound, NetExec, LDAP, and PingCastle
@@ -105,12 +127,12 @@ export MSC_NESSUS_VERIFY_TLS='true'
 Boolean variables accept `true/false`, `yes/no`, `on/off`, or `1/0`. Command-line `--output` overrides `MSC_OUTPUT`. Environment variables are inherited by child processes and may be readable by sufficiently privileged local users, so unset direct secret variables after the run (`unset MSC_AD_PASSWORD MSC_NESSUS_PASSWORD`) and prefer secret files or interactive prompts.
 
 * **Output:** `--output` selects the parent; otherwise `MSC_OUTPUT` is used when set, followed by the current-directory default. Each run directory is created mode `0700`.
-* **Nessus:** enter the `https://host:8834` URL interactively. API access/secret keys are preferred; username/password `/session` authentication is also supported. The account needs permission to view and export each chosen scan. TCP connectivity and enabled scan exports are required. TLS verification is on unless the operator explicitly disables it. When disabled, the collector prints one prominent warning and suppresses only urllib3's repetitive `InsecureRequestWarning` messages for those requests; unrelated warnings remain visible. Exports use the Nessus `/scans`, `/scans/{scan_id}/export`, status, and download workflow. Each scan produces `<scan>_by_host.pdf`, `<scan>_by_plugin.pdf`, `<scan>_results.csv`, and `<scan>_results.nessus` when all formats are selected.
+* **Nessus:** enter the `https://host:8834` URL interactively. API access/secret keys are preferred; username/password `/session` authentication is also supported. The account needs permission to view and export each chosen scan. TCP connectivity and enabled scan exports are required. TLS verification is on unless the operator explicitly disables it. When disabled, the collector prints one prominent warning and suppresses only urllib3's repetitive `InsecureRequestWarning` messages for those requests; unrelated warnings remain visible. Exports use the Nessus `/scans`, `/scans/{scan_id}/export`, status, and download workflow. Temporary `404`, `409`, `429`, and `5xx` responses from the asynchronous status endpoint are retried with backoff (up to ten consecutive failures), addressing intermittent Nessus HTTP 500 responses while still surfacing persistent server-side failures. Each scan produces `<scan>_by_host.pdf`, `<scan>_by_plugin.pdf`, `<scan>_results.csv`, and `<scan>_results.nessus` when all formats are selected.
 * **Certipy:** an ordinary authorized domain account normally suffices for read-only `find` enumeration; access can be limited by directory ACLs. The tool confirms the installed CLI exposes `find` and its output flags.
 * **BloodHound:** an authorized domain account needs the directory/network read access required by the chosen collection method. The collector discovers `bloodhound-python`/`bloodhound-ce-python`, reads help, and saves output locally without upload. The operator can separately set the domain controller (`-dc`) and an optional DNS name server (`-ns`); unsupported options are reported rather than guessed.
 * **NetExec SMB sweep:** the account needs only the desired SMB authentication/read access. The module asks for a `scope.txt` path, validates that it is a non-empty regular file, preserves a private copy with the evidence, and passes that file to NetExec as its target source. Put one supported host, IP, CIDR, or range per line according to the installed NetExec version. The saved `smb_sweep.txt` and JSON data contain only hosts for which NetExec explicitly reports SMB signing as `False`, `disabled`, or `no`; ANSI color codes are removed. The module uses no command-execution option.
 * **LDAP signing/channel binding:** this separate module asks whether the domain controllers have a different scope file. If skipped, it reuses the SMB `scope.txt` (preferring the copy already preserved by this run); otherwise it accepts a DC-only file or `MSC_LDAP_SCOPE_FILE`. It invokes NetExec's read-only `ldap-checker`, first checking `nxc ldap -L` and failing clearly if unavailable. The saved text report contains only responding DC lines that mention LDAP signing or channel binding; generic authentication/banner lines are omitted. The input scope is preserved as `ldap/dc_scope.txt`. The account requires LDAP authentication and ordinary directory connectivity; the collector does not modify LDAP configuration.
-* **PingCastle:** WinRM must already be enabled and allowed by the firewall. TCP 5986/HTTPS is recommended; 5985/HTTP and custom ports are supported. The account must be permitted to use WinRM, execute the existing PingCastle binary, read its generated reports, and perform PingCastle's directory health check. Supply the executable path or install it at a displayed standard location. The collector separately prompts for the AD DNS domain/server and executes the installed tool as `PingCastle.exe --healthcheck --server <domain>` only after confirming both options in its help output. This value defaults to the reused credential domain but can be overridden (for example, `domain.local`). NTLM WinRM cannot delegate the authenticated logon to LDAP (the “double hop”), so the default is to pass the in-memory assessment credentials through PingCastle's detected `--user`/`--password` options. They are sent inside the encrypted WinRM channel and redacted from logs, but can be briefly visible to administrators inspecting the Windows process command line. Environments with correctly configured Kerberos/CredSSP delegation may opt out. The collector also treats PingCastle's “Could not query Active Directory” output as failure even when that PingCastle release incorrectly exits with code 0. An untrusted HTTPS certificate is rejected unless explicitly overridden.
+* **PingCastle:** WinRM must already be enabled and allowed by the firewall. TCP 5986/HTTPS is recommended; 5985/HTTP and custom ports are supported. The account must be permitted to use WinRM, execute the existing PingCastle binary, read its generated reports, and perform PingCastle's directory health check. Supply the executable path or its containing directory. The collector separately prompts for the AD DNS domain/server and executes `PingCastle.exe --healthcheck --server <domain>`. It probes `--help`, `-h`, and `/?`; because some PingCastle 4 builds return incomplete help over WinRM, it records the help and falls back to the compatible version-4 syntax instead of rejecting a working binary. This value defaults to the reused credential domain but can be overridden (for example, `domain.local`). NTLM WinRM cannot delegate the authenticated logon to LDAP (the “double hop”), so the default is to pass the in-memory assessment credentials through PingCastle's `--user`/`--password` options. They are sent inside the encrypted WinRM channel and redacted from logs, but can be briefly visible to administrators inspecting the Windows process command line. Environments with correctly configured Kerberos/CredSSP delegation may opt out. The collector also treats PingCastle's “Could not query Active Directory” output as failure even when that PingCastle release incorrectly exits with code 0. An untrusted HTTPS certificate is rejected unless explicitly overridden.
 
 ```text
 Kali
@@ -139,6 +161,8 @@ Internal_Network_Scan_results.nessus
 
 Existing files are not overwritten; a numeric suffix is added when necessary. PDF chapters use Nessus's `vuln_hosts_summary` and `vuln_by_plugin` export chapters.
 
+Before the manifest and ZIP are created, every collector output is normalized to a Windows-compatible name. The normalizer preserves readable punctuation such as parentheses, replaces spaces and Windows-forbidden characters with underscores, avoids reserved names such as `CON` and `NUL`, retains extensions, limits component length, and resolves collisions without overwriting files. For example, `Current SJD server range (Windows / RedHat)` becomes `Current_SJD_server_range_(Windows___RedHat)`. This also applies to Certipy, BloodHound, PingCastle, NetExec, and LDAP artifacts.
+
 ## Output
 
 ```text
@@ -153,6 +177,7 @@ assessment_2026-09-30_103000/
 ├── pingcastle/{remote_execution.log,...}
 ├── netexec/{scope.txt,smb_sweep.txt}
 ├── ldap/{dc_scope.txt,ldap_signing_channel_binding.txt}
+├── comparison.{json,txt}                 # when comparison is requested
 ├── logs/{collection,nessus,certipy,bloodhound,pingcastle,netexec,ldap}.log
 └── manifest.json
 assessment_2026-09-30_103000.zip

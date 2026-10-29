@@ -16,7 +16,9 @@ from .utils import sanitize_filename, unique_path
 
 
 class NessusError(RuntimeError):
-    pass
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +63,7 @@ class NessusClient:
         except requests.RequestException as exc:
             status = getattr(exc.response, "status_code", None)
             detail = f" (HTTP {status})" if status else ""
-            raise NessusError(f"Nessus request failed{detail}: {exc}") from exc
+            raise NessusError(f"Nessus request failed{detail}: {exc}", status) from exc
 
     def authenticate_password(self, username: str, password: str) -> None:
         response = self._request("POST", "/session", json={"username": username, "password": password})
@@ -87,8 +89,26 @@ class NessusClient:
     def wait_for_export(self, scan_id: int, file_id: int, poll_interval: float = 2,
                         poll_timeout: float = 600) -> None:
         deadline = time.monotonic() + poll_timeout
+        transient_failures = 0
+        transient_statuses = {404, 409, 429, 500, 502, 503, 504}
         while time.monotonic() < deadline:
-            status = self._request("GET", f"/scans/{scan_id}/export/{file_id}/status").json().get("status")
+            try:
+                status = self._request("GET", f"/scans/{scan_id}/export/{file_id}/status").json().get("status")
+                transient_failures = 0
+            except NessusError as exc:
+                if exc.status_code not in transient_statuses:
+                    raise
+                transient_failures += 1
+                if transient_failures > 10:
+                    raise NessusError(
+                        f"Nessus export status failed {transient_failures} consecutive times; last error: {exc}",
+                        exc.status_code,
+                    ) from exc
+                logging.getLogger("nessus").warning(
+                    "Transient Nessus export status error (%d/10): %s", transient_failures, exc)
+                print(f"[!] Nessus status temporarily unavailable; retrying ({transient_failures}/10)")
+                time.sleep(min(poll_interval * transient_failures, 15))
+                continue
             if status == "ready":
                 return
             if status in {"error", "cancelled", "canceled"}:
