@@ -14,6 +14,7 @@ def response(payload=None, status=200):
     result.json.return_value = payload or {}
     result.raise_for_status.side_effect = None if status < 400 else requests.HTTPError(response=result)
     result.status_code = status
+    result.text = ""
     return result
 
 
@@ -38,6 +39,25 @@ def test_export_polling_retries_transient_server_error(_sleep):
     session.request.side_effect = [response(status=500), response({"status": "ready"})]
     NessusClient("https://nessus", session=session).wait_for_export(170, 1047954425, poll_interval=0)
     assert session.request.call_count == 2
+
+
+@patch("assessment_collector.nessus.time.sleep", return_value=None)
+def test_export_start_retries_conflict_until_accepted(_sleep):
+    session = Mock()
+    session.request.side_effect = [response({"error": "An export is already being processed"}, 409),
+                                   response({"file": 123})]
+    client = NessusClient("https://nessus", session=session)
+    assert client.start_export(168, EXPORTS["csv"], retry_interval=0) == 123
+    assert session.request.call_count == 2
+
+
+@patch("assessment_collector.nessus.time.sleep", return_value=None)
+def test_export_start_reports_persistent_conflict(_sleep):
+    session = Mock()
+    session.request.side_effect = [response({"error": "Scan is currently running"}, 409)] * 3
+    client = NessusClient("https://nessus", session=session)
+    with pytest.raises(NessusError, match="scan may still be running.*Scan is currently running"):
+        client.start_export(168, EXPORTS["csv"], max_attempts=3, retry_interval=0)
 
 
 def test_export_payloads_include_two_pdf_layouts():
